@@ -1,52 +1,86 @@
-import aiohttp
-import asyncio
+import requests
 import socketio
-import os 
+import logging
+import threading
+import os
+from dotenv import load_dotenv, dotenv_values
 
-async def login(username, password):
-    connector = aiohttp.TCPConnector(ssl=False)  # Disable SSL verification if needed
-    async with aiohttp.ClientSession(connector=connector) as session:
-        payload = {'username': username, 'password': password}
-        async with session.post(f"https://172.20.2.54/bt/api/login", json=payload) as response:
-            if response.status != 200:
-                print(f"Login failed: HTTP {response.status}")
-                return
+load_dotenv()
 
-            data = await response.json()
-            token = data.get('token')
-            if token:
-                print(f"Token: {token}")
-                print("Login successful, connecting to socket...")
-                await connect_to_socket(token)
-            else:
-                print("Login failed: No token received")
 
-async def connect_to_socket(token):
-    connector = aiohttp.TCPConnector(ssl=False)  # Disable SSL verification if needed
-    http_session = aiohttp.ClientSession(connector=connector)
+SERVER_IP = os.getenv("SERVER_IP")
+USERNAME = os.getenv("USERNAME")
+PASSWORD = os.getenv("PASSWORD")
+BASE_API_URL = f"https://{SERVER_IP}/bt/api"
+HEADERS = {
+        'accept': "application/json",
+        'content-type': "application/json"
+    }
 
-    sio = socketio.AsyncClient(http_session=http_session)
+
+def login():
+
+    login_url = f"{BASE_API_URL}/login"
     
 
-    @sio.event
-    async def connect():
-        print('Connected to socket')
+    response = requests.post(login_url, headers=HEADERS, json={'username': USERNAME, 'password': PASSWORD}, verify=False)
+    
+    json_response = response.json()
+    
+    token = json_response["token"]
+    HEADERS["authorization"] = f"Bearer {token}"
+    return token
 
-    @sio.event
-    async def disconnect():
-        print('Disconnected from socket')
+def get_groups():
+    groups_url = f"{BASE_API_URL}/groups"
+    response = requests.get(groups_url, headers=HEADERS, verify=False)
+    return response.json()
 
-    try:
-        await sio.connect(f'https://172.20.2.54/bt/api/socket.io/?token={token}')
-        await sio.wait()
-    except Exception as e:
-        print(f"Socket connection failed: {e}")
+def create_socket(token):
 
-async def main():
+    #sio = socketio.Client(logger=True, engineio_logger=True, reconnection=True, ssl_verify=False) logging purposes
 
-    username = os.environ.get('USERNAME')
-    password = os.environ.get('PASSWORD')
-    await login(username, password)
+    sio = socketio.Client(reconnection=True, ssl_verify=False)
+
+    @sio.on('connect')
+    def connect():
+        print("connected to socket")
+    
+    @sio.on('disconnect')
+    def disconnect(reason):
+        if reason == sio.reason.CLIENT_DISCONNECT:
+            print('the client disconnected')
+        elif reason == sio.reason.SERVER_DISCONNECT:
+            print('the server disconnected the client')
+        else:
+            print('disconnect reason:', reason)
+    
+    @sio.on('connect_error')
+    def connect_error(data):
+        print("The connection failed!")
+    
+    @sio.on('track:created')
+    def track_created(data):
+        #print("Track created: ", data)
+        data = data[0]
+        response = {"track_id": data["id"], "location_tracked": data["camera"]["title"], "subject": data["subject"]}
+        print(response)
+
+
+    def create_connection(token):
+        try:
+            sio.connect(url=f"https://{SERVER_IP}/?token={token}", socketio_path="/bt/api/socket.io")
+            sio.wait()
+        except Exception as e:
+            print(e)
+            sio.disconnect()
+    
+    thread = threading.Thread(target=create_connection(token))
+    thread.start()
+    thread.join()
+
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    #logging.basicConfig(level=logging.DEBUG) IF YOU WANT TO LOG
+    api_token = login()
+    create_socket(api_token)
