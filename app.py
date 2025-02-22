@@ -60,13 +60,20 @@ def create_socket(token):
         print("The connection failed!")
     
     @sio.on('track:created')
-    def track_created(data):
+    def track_created(track_data):
         #print("Track created: ", data)
-        data = data[0]
-        response = {"track_id": data["id"], "location_tracked": data["camera"]["title"], "subject": data["subject"]}
-        print(response)
+        track = track_data[0]
+        response = {"track_id": track["id"], "location_tracked": track["camera"]["title"], "subject": track["subject"], "featuresQuality": track["featuresQuality"], "subjectScore": track["subjectScore"], "matches": track["closeMatches"]}
+        print(f"{response['subject']} was detected from {response['location_tracked']}, with a score of {response['subjectScore']}, close matches: {response['matches']}")
+    
+    @sio.on('recognition:created')
+    def recognition_created(recognition_data):
+        recognition = recognition_data[0]
+        response = {"recognition_id": recognition["id"], "location_recognized": recognition["camera"]["title"], "relatedTrackId": recognition["relatedTrackId"], "subjectScore": recognition["subjectScore"], "matches": recognition["closeMatches"], "name": recognition["subject"]["name"]}
 
-
+        print(f"{response["name"]} was recognized from {response['location_recognized']}, with a score of {response['subjectScore']} ")
+    
+    
     def create_connection(token):
         try:
             sio.connect(url=f"https://{SERVER_IP}/?token={token}", socketio_path="/bt/api/socket.io")
