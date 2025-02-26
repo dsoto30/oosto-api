@@ -10,6 +10,7 @@ h11==0.14.0
 idna==3.10
 multidict==6.1.0
 propcache==0.3.0
+pyodbc==5.2.0
 python-dotenv==1.0.1
 python-engineio==4.11.2
 python-socketio==5.12.1
