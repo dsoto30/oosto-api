@@ -4,6 +4,7 @@ import threading
 import os
 from dotenv import load_dotenv
 import pyodbc
+from datetime import datetime
 
 load_dotenv()
 
@@ -26,8 +27,6 @@ conn_str = (
 )
 
 conn = pyodbc.connect(conn_str)
-cursor = conn.cursor()
-print("connected to db")
 
 
 SERVER_IP = os.getenv("SERVER_IP")
@@ -38,7 +37,6 @@ HEADERS = {
         'accept': "application/json",
         'content-type': "application/json"
     }
-
 
 def login():
 
@@ -62,6 +60,11 @@ def create_socket(token):
     @sio.on('connect')
     def connect():
         print("connected to socket")
+
+    @sio.on('disconnect')
+    def disconnect():
+        conn.close()
+
     
     @sio.on('connect_error')
     def connect_error(data):
@@ -79,10 +82,9 @@ def create_socket(token):
 
         if unknown create subject through OOSTO in guest group
         """
-        print(f"Got {len(track_data)} detections!")
         
         imageQualityThreshold = 80
-        closestMatchScoreThreshold = .50
+        closestMatchScoreThreshold = .45
         guest_group_id = "ee87c48a-146c-4a0d-820a-df4c0cacb41d"
 
         track = track_data[0]
@@ -115,23 +117,36 @@ def create_socket(token):
 
 
 
-    # @sio.on('recognition:created')
-    # def recognition_created(recognition_data):
+    @sio.on('recognition:created')
+    def recognition_created(recognition_data):
 
-    #     """
-    #     Give group_id of camera of recognition check if it's from entrance group If not ignore.
+        """
+        Give group_id of camera of recognition check if it's from entrance group If not ignore.
 
-    #     check if subject_id already exists in table if not insert recognition information
+        check if subject_id already exists in table if not insert recognition information also check if group_id matches guest group
 
-    #     SQL Job to run at 6am daily and COUNT * FROM recognitions table (should be all unique) prune table after
+        SQL Job to run at 6am daily and COUNT * FROM recognitions table (should be all unique) prune table after
+        """
+        recognition = recognition_data[0]
+        guest_group_id = "ee87c48a-146c-4a0d-820a-df4c0cacb41d"
 
-    #     Most stuff should be done by the UI or API calls
-    #     """
-    #     recognition = recognition_data[0]
-    #     response = {"recognition_id": recognition["id"], "location_recognized": recognition["camera"]["title"], "relatedTrackId": recognition["relatedTrackId"], "subjectScore": recognition["subjectScore"], "matches": recognition["closeMatches"], "name": recognition["subject"]["name"]}
+        if recognition['subject']['groups'][0]['id'] == guest_group_id:
+            cursor = conn.cursor()
 
-    #     print(f"{response["name"]} was recognized from {response['location_recognized']}, with a score of {response['subjectScore']} ")
+            subject_id = recognition['subject']['id']
+            time_recognized = datetime.fromisoformat(recognition['frameTimeStamp'])
 
+            query = """
+                        MERGE INTO entrance_recognitions AS target
+                        USING (SELECT ? AS subject_id, ? AS time_entered) AS source
+                        ON target.subject_id = source.subject_id
+                        WHEN NOT MATCHED THEN 
+                            INSERT (subject_id, time_entered) VALUES (source.subject_id, source.time_entered);
+                        """
+            
+            cursor.execute(query, (subject_id, time_recognized))
+            conn.commit()
+            cursor.close()
 
     def create_connection(token):
         try:
