@@ -1,25 +1,28 @@
 import requests
 import socketio
-import threading
-import os
 from dotenv import load_dotenv
 import pyodbc
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 import queue
+import logging
+import threading
 
 load_dotenv()
 
 
-DB_SERVER = os.getenv("DB_SERVER")
-DB_NAME = os.getenv("DB_NAME")
-DB_USER = os.getenv("DB_USER")
-DB_PASSWORD = os.getenv("DB_PASSWORD")
+"""
+COPY ENVIRONMENT VARIABLES FROM .env FILE TO THIS SCRIPT. HARDCODED VALUES FOR NOW
+"""
 
 
-DETECTION_MISSED = 0
-CREATED_GUESTS = 0
+log_file = "oosto_logs.log"
+logging.basicConfig(filename=log_file, level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", filemode="a")
 
+
+def log_message(message):
+    logging.info(message)
+    print(message)
 
 conn_str = (
     'DRIVER={ODBC Driver 18 for SQL Server};'
@@ -30,21 +33,19 @@ conn_str = (
     'TrustServerCertificate=yes;'
 )
 
-connection_pool = queue.Queue(maxsize=20)
-for _ in range(20):
+connection_pool = queue.Queue(maxsize=8)
+executor = ThreadPoolExecutor(max_workers=12)
+
+for _ in range(8):
     connection_pool.put(pyodbc.connect(conn_str))
 
 
-SERVER_IP = os.getenv("SERVER_IP")
-USERNAME = os.getenv("USERNAME")
-PASSWORD = os.getenv("PASSWORD")
 BASE_API_URL = f"https://{SERVER_IP}/bt/api"
 HEADERS = {
         'accept': "application/json",
         'content-type': "application/json"
     }
 
-executor = ThreadPoolExecutor(max_workers=25)
 
 def login():
 
@@ -67,10 +68,13 @@ def process_recognition(recognition):
         subject_id = recognition['subject']['id']
         time_recognized = datetime.fromisoformat(recognition['frameTimeStamp'])
 
-        conn = connection_pool.get()
+        if connection_pool.empty():
+            log_message("connection pool is empty!")
 
+        conn = connection_pool.get()
+        cursor = conn.cursor()
         try:
-            cursor = conn.cursor()
+            
             query = """
                     MERGE INTO entrance_recognitions AS target
                     USING (SELECT ? AS subject_id, ? AS time_entered) AS source
@@ -79,11 +83,15 @@ def process_recognition(recognition):
                         INSERT (subject_id, time_entered) VALUES (source.subject_id, source.time_entered);
                     """
             cursor.execute(query, (subject_id, time_recognized))
+            
+            if cursor.rowcount > 0:
+                log_message(f"processed subject {recognition["subject"]["name"]}, id: {subject_id} at {time_recognized}")
             conn.commit()
-            cursor.close()
+            
         except Exception as e:
-            print(f"Database error: {e}")
+            log_message(f"Database error: {e}")
         finally:
+            cursor.close()
             connection_pool.put(conn)
 
 
@@ -95,31 +103,29 @@ def create_socket(token):
 
     @sio.on('connect')
     def connect():
-        print("connected to socket")
+        log_message("connected to socket")
 
     @sio.on('disconnect')
     def disconnect():
-        print("Disconnected from socket. Closing database connections...")
+        log_message("Disconnected from socket. Closing database connections...")
 
         # Close all database connections in the pool
         while not connection_pool.empty():
             conn = connection_pool.get()
             conn.close()
         
-        print("All database connections closed.")
+        log_message("All database connections closed.")
 
     
     @sio.on('connect_error')
     def connect_error(data):
-        print("The connection failed!")
+        log_message("The connection failed!")
 
     def find_closest_match(matches):
         return max([match['score'] for match in matches])
 
     @sio.on('track:created')
     def track_created(track_data):
-        global DETECTION_MISSED
-        global CREATED_GUESTS
         
         imageQualityThreshold = 80
         closestMatchScoreThreshold = .45
@@ -128,32 +134,57 @@ def create_socket(token):
         track = track_data[0]
         # print(track)
         closest_match_score = 0 if not track['closeMatches'] else find_closest_match(track['closeMatches'])
-        if closest_match_score <= closestMatchScoreThreshold:
-            if track["landmarkScore"] >= imageQualityThreshold:
-                body_request = {
-                    "name": "John Doe",
-                    "description": "",
-                    "groups": [guest_group_id],
-                    "sendToHq": False,
-                    "searchBackwards": [{
-                        "searchBackwardsThreshold": .6,
-                        "objectType": track["objectType"]
-                    }],
-                    "images": [
-                        {"isPrimary": True, "landmarkScore": track['landmarkScore'], "objectType": track['objectType'], "url": track['images'][0]['url'], "track": {
-                            "camera": track['camera']['id'], "frameTimeStamp": track['frameTimeStamp'], "id": track['id']
-                        }}
-                        ]
-                    
-                }
+        if closest_match_score <= closestMatchScoreThreshold and track["landmarkScore"] >= imageQualityThreshold:
+            body_request = {
+                "name": "John Doe",
+                "description": "",
+                "groups": [guest_group_id],
+                "sendToHq": False,
+                "searchBackwards": [{
+                    "searchBackwardsThreshold": .6,
+                    "objectType": track["objectType"]
+                }],
+                "images": [
+                    {"isPrimary": True, "landmarkScore": track['landmarkScore'], "objectType": track['objectType'], "url": track['images'][0]['url'], "track": {
+                        "camera": track['camera']['id'], "frameTimeStamp": track['frameTimeStamp'], "id": track['id']
+                    }}
+                    ]
+                
+            }
 
-                executor.submit(requests.post, f"{BASE_API_URL}/subjects/from-track", json=body_request, verify=False, headers=HEADERS)
-                print("added unknown person to guest group!")
-                CREATED_GUESTS += 1
-            else:
-                DETECTION_MISSED += 1 # missed that we believe are unknown
+            executor.submit(requests.post, f"{BASE_API_URL}/subjects/from-track", json=body_request, verify=False, headers=HEADERS)
+            log_message(f"Added unkown to Guest Group image quality score was {track["landmarkScore"]} and closest match score was {closest_match_score}")
+        else:
+            track_id = track['id']
+            collate_id = track["collateId"]
+            frameQualityScore = track["landmarkScore"]
 
-        print(f"Created Guests = {CREATED_GUESTS}, Guests miss hits = {DETECTION_MISSED}")
+            if connection_pool.empty():
+                log_message("connection pool is empty!")
+
+            conn = connection_pool.get()
+            cursor = conn.cursor()
+            try:
+                
+                query = """
+                    MERGE INTO tracks_missed AS target
+                    USING (SELECT ? AS track_id, ? AS collate_id, ? AS frameQualityScore, ? AS closeMatchScore) AS source
+                    ON target.track_id = source.track_id
+                    WHEN NOT MATCHED THEN
+                        INSERT (track_id, collate_id, frameQualityScore, closeMatchScore)
+                        VALUES (source.track_id, source.collate_id, source.frameQualityScore, source.closeMatchScore);
+                    """
+                cursor.execute(query, (track_id, collate_id, frameQualityScore , closest_match_score))
+                
+                if cursor.rowcount > 0:
+                    log_message(f"Dismissed track {track_id}, quality score: {frameQualityScore}, closest match score: {closest_match_score}")
+                conn.commit()
+                
+            except Exception as e:
+                log_message(f"Database error: {e}")
+            finally:
+                cursor.close()
+                connection_pool.put(conn)
 
     @sio.on('recognition:created')
     def recognition_created(recognition_data):
@@ -164,17 +195,19 @@ def create_socket(token):
     def create_connection(token):
         try:
             sio.connect(url=f"https://{SERVER_IP}/?token={token}", socketio_path="/bt/api/socket.io")
-            sio.wait()
-        except Exception as e:
-            print(f"Socket connection error: {e}")
+            sio.wait()  # This will block and allow socket.io to listen for events
+        except KeyboardInterrupt:
             sio.disconnect()
+
+    socket_thread = threading.Thread(target=create_connection, args=(token,))
+    socket_thread.start()
+    socket_thread.join()
     
-    thread = threading.Thread(target=create_connection(token), daemon=True)
-    thread.start()
 
 
-
-
-if __name__ == '__main__':
+def main():
     api_token = login()
     create_socket(api_token)
+
+if __name__ == "__main__":
+    main()
