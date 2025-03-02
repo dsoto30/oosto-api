@@ -7,13 +7,14 @@ from concurrent.futures import ThreadPoolExecutor
 import queue
 import logging
 import threading
+import os
 
 load_dotenv()
-
 
 """
 COPY ENVIRONMENT VARIABLES FROM .env FILE TO THIS SCRIPT. HARDCODED VALUES FOR NOW
 """
+
 
 
 log_file = "oosto_logs.log"
@@ -33,10 +34,14 @@ conn_str = (
     'TrustServerCertificate=yes;'
 )
 
-connection_pool = queue.Queue(maxsize=8)
-executor = ThreadPoolExecutor(max_workers=12)
+num_threads = os.cpu_count() // 2
+num_dbconnections = num_threads - 2
+connection_pool = queue.Queue(maxsize=num_dbconnections)
+executor = ThreadPoolExecutor(max_workers=num_threads)
 
-for _ in range(8):
+
+
+for _ in range(num_dbconnections):
     connection_pool.put(pyodbc.connect(conn_str))
 
 
@@ -67,9 +72,6 @@ def process_recognition(recognition):
     if recognition['subject']['groups'][0]['id'] == guest_group_id:
         subject_id = recognition['subject']['id']
         time_recognized = datetime.fromisoformat(recognition['frameTimeStamp'])
-
-        if connection_pool.empty():
-            log_message("connection pool is empty!")
 
         conn = connection_pool.get()
         cursor = conn.cursor()
@@ -158,9 +160,6 @@ def create_socket(token):
             track_id = track['id']
             collate_id = track["collateId"]
             frameQualityScore = track["landmarkScore"]
-
-            if connection_pool.empty():
-                log_message("connection pool is empty!")
 
             conn = connection_pool.get()
             cursor = conn.cursor()
