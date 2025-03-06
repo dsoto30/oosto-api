@@ -12,7 +12,6 @@ load_dotenv()
 COPY ENVIRONMENT VARIABLES FROM .env FILE TO THIS SCRIPT. HARDCODED VALUES FOR NOW
 """
 
-
 log_file = "oosto_logs.log"
 logging.basicConfig(filename=log_file, level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", filemode="a")
 
@@ -32,8 +31,15 @@ async def create_db_pool():
     f'PWD={DB_PASSWORD};'
     'TrustServerCertificate=yes;')
 
-    pool = await aioodbc.create_pool(dsn=conn_str, minsize=1, maxsize=10)
+    pool = await aioodbc.create_pool(dsn=conn_str)
 
+
+async def close_db_pool():
+    global pool
+    if pool:
+        pool.close()
+        await pool.wait_closed()
+        log_message("All database connections closed")
 
 BASE_API_URL = f"https://{SERVER_IP}/bt/api"
 HEADERS = {
@@ -52,17 +58,32 @@ async def login():
             json_response = await response.json()
             token = json_response["token"]
             HEADERS["authorization"] = f"Bearer {token}"
+            log_message(f"Logged Got API TOKEN")
             return token
 
+def find_closest_match(matches):
+    return max([match['score'] for match in matches])
+
+def construct_images(track):
+    res = []
+    for i, image in enumerate(track['images']):
+        obj = {"isPrimary": i==2, "landmarkScore": track['landmarkScore'], "objectType": track['objectType'], "url": image['url'], "track": {
+                    "camera": track['camera']['id'], "frameTimeStamp": track['frameTimeStamp'], "id": track['id']
+                }}
+        res.append(obj)
+    return res
+
 async def process_track(track):
-    imageQualityThreshold = 80
+    imageQualityThreshold = 75 # OOSTO RECOMMENDS 80 WE MIGHT NEED TO FIX CAMERA POSITIONING AT ENTRANCES TO CAPTURE GOOD SHOTS OF GUESTS
     closestMatchScoreThreshold = .45
     guest_group_id = "ee87c48a-146c-4a0d-820a-df4c0cacb41d"
+
+    gender = "male" if track["metadata"]["attributes"]['gender'][0] == 1 else "female"
 
     closest_match_score = 0 if not track['closeMatches'] else find_closest_match(track['closeMatches'])
     if closest_match_score <= closestMatchScoreThreshold and track["landmarkScore"] >= imageQualityThreshold:
         body_request = {
-            "name": "John Doe",
+            "name": "John Doe" if gender == "male" else "Mary Jane",
             "description": "",
             "groups": [guest_group_id],
             "sendToHq": False,
@@ -70,21 +91,14 @@ async def process_track(track):
                 "searchBackwardsThreshold": .6,
                 "objectType": track["objectType"]
             }],
-            "images": [
-                {"isPrimary": True, "landmarkScore": track['landmarkScore'], "objectType": track['objectType'], "url": track['images'][0]['url'], "track": {
-                    "camera": track['camera']['id'], "frameTimeStamp": track['frameTimeStamp'], "id": track['id']
-                }}
-                ]
-            
+            "images": construct_images(track)     
         }
 
         async with aiohttp.ClientSession() as session:
             async with session.post(url=f"{BASE_API_URL}/subjects/from-track", json=body_request, headers=HEADERS, ssl=False) as response:
                 if response.status == 201:
                     response_json = await response.json()
-                    log_message(f"Added unknown {response_json["id"]} to Guest Group. Image quality score: {track['landmarkScore']}, closest match score: {closest_match_score} at {track['frameTimeStamp']}")
-
-
+                    log_message(f"Added {response_json['name']}, id: {response_json["id"]} to Guest Group. Image quality score: {track['landmarkScore']}, closest match score: {closest_match_score} at {track['frameTimeStamp']}")
     else:
         track_id = track['id']
         collate_id = track["collateId"]
@@ -93,18 +107,16 @@ async def process_track(track):
             async with conn.cursor() as cursor:
                 try:
                     query = """
-                        MERGE INTO tracks_missed AS target
-                        USING (SELECT ? AS track_id, ? AS collate_id, ? AS frameQualityScore, ? AS closeMatchScore) AS source
-                        ON target.track_id = source.track_id
-                        WHEN NOT MATCHED THEN
-                            INSERT (track_id, collate_id, frameQualityScore, closeMatchScore)
-                            VALUES (source.track_id, source.collate_id, source.frameQualityScore, source.closeMatchScore);
-                        """
-                    await cursor.execute(query, (track_id, collate_id, frameQualityScore , closest_match_score))
-                    
-                    if cursor.rowcount > 0:
-                        log_message(f"Dismissed track {track_id}, quality score: {frameQualityScore}, closest match score: {closest_match_score}, at {track['landmarkScore']}")
+                            INSERT INTO tracks_missed (track_id, collate_id, frameQualityScore, closeMatchScore, time_missed)
+                            SELECT ?, ?, ?, ?, ?
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM tracks_missed WHERE track_id = ?
+                            );
+                            """
+                    await cursor.execute(query, (track_id, collate_id, frameQualityScore , closest_match_score, track['frameTimeStamp'], track_id))
                     await conn.commit()
+                    if cursor.rowcount > 0:
+                        log_message(f"Dismissed track {track_id}, quality score: {frameQualityScore}, closest match score: {closest_match_score}, at {track['frameTimeStamp']}")
                 except Exception as e:
                     log_message(f"Database error: {e}")
 
@@ -119,42 +131,41 @@ async def process_recognition(recognition):
             async with conn.cursor() as cursor:
                 try:
                     query = """
-                            MERGE INTO entrance_recognitions AS target
-                            USING (SELECT ? AS subject_id, ? AS time_entered) AS source
-                            ON target.subject_id = source.subject_id
-                            WHEN NOT MATCHED THEN 
-                                INSERT (subject_id, time_entered) VALUES (source.subject_id, source.time_entered);
+                            INSERT INTO entrance_recognitions (subject_id, time_entered)
+                            SELECT ?, ?
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM entrance_recognitions WHERE subject_id = ?
+                            );
                             """
-                    await cursor.execute(query, (subject_id, time_recognized))
-                    
-                    if cursor.rowcount > 0:
-                        log_message(f"processed subject recognition {recognition["subject"]["name"]}, id: {subject_id} at {time_recognized}")
+                    await cursor.execute(query, (subject_id, time_recognized, subject_id))
                     await conn.commit()
+                    if cursor.rowcount > 0:
+                        log_message(f"processed unique subject entrance recognition {recognition["subject"]["name"]}, id: {subject_id} at {time_recognized}")
                 except Exception as e:
                     log_message(f"Database error: {e}")
 
 
 
 
-sio = socketio.AsyncClient(reconnection=True, ssl_verify=False)
+sio = socketio.AsyncClient(reconnection=True, reconnection_delay=1, ssl_verify=False)
 
 @sio.on('connect')
-async def connect():
+def connect():
     log_message("connected to socket")
 
 @sio.on('disconnect')
-async def disconnect():
-    log_message("Disconnected from socket. Closing database connections...")
-    pool.close()
-    await pool.wait_closed()
-    log_message("All database connections closed")
+def disconnect(reason):
+    if reason == sio.reason.CLIENT_DISCONNECT:
+        print('the client disconnected')
+    elif reason == sio.reason.SERVER_DISCONNECT:
+        print('the server disconnected the client')
+    else:
+        print('disconnect reason:', reason)
+
 
 @sio.on('connect_error')
 def connect_error(data):
-    log_message("The connection failed!")
-
-def find_closest_match(matches):
-    return max([match['score'] for match in matches])
+    log_message(f"There was an error connecting: {data}")
 
 @sio.on('track:created')
 async def track_created(track_data):
@@ -169,12 +180,8 @@ async def recognition_created(recognition_data):
     await process_recognition(recognition)
 
 async def create_socket(token):
-    try: 
-        await sio.connect(url=f"https://{SERVER_IP}/?token={token}", socketio_path="/bt/api/socket.io")
-        await sio.wait()
-    except Exception as e:
-        log_message(str(e))
-        await sio.disconnect()
+    await sio.connect(url=f"https://{SERVER_IP}/?token={token}", socketio_path="/bt/api/socket.io")
+    await sio.wait()
 
 
 async def main():
@@ -182,8 +189,14 @@ async def main():
         await create_db_pool()
         api_token =  await login()
         await create_socket(api_token)
-    except KeyboardInterrupt:
-        await disconnect()
+    except asyncio.CancelledError:
+        log_message("async task cancelled")
+    finally:
+        await close_db_pool()
+        await sio.disconnect()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
