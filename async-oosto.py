@@ -156,11 +156,11 @@ def connect():
 @sio.on('disconnect')
 def disconnect(reason):
     if reason == sio.reason.CLIENT_DISCONNECT:
-        print('the client disconnected')
+        log_message('the client disconnected')
     elif reason == sio.reason.SERVER_DISCONNECT:
-        print('the server disconnected the client')
+        log_message('the server disconnected the client')
     else:
-        print('disconnect reason:', reason)
+        log_message('disconnect reason:', reason)
 
 
 @sio.on('connect_error')
