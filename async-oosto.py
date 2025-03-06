@@ -58,7 +58,7 @@ async def login():
             json_response = await response.json()
             token = json_response["token"]
             HEADERS["authorization"] = f"Bearer {token}"
-            log_message(f"Logged Got API TOKEN")
+            log_message(f"Got API TOKEN")
             return token
 
 def find_closest_match(matches):
